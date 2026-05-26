@@ -15,7 +15,7 @@ You built a site with Claude Code (or Cursor, or Lovable, or just your own hands
 
 ## Status
 
-**v0.1 alpha.** Expect rough edges and missing pieces. Specifically:
+**v0.1** — early release. The core works on real-world apps (verified on multi-tier landing pages, testimonial sections, hero sections, pricing tables, feature lists). Expect rough edges. Specifically:
 
 - **Dev-mode only.** The provider is a no-op in production builds and the route handler hard-refuses any request unless `NODE_ENV === "development"`.
 - **App Router only.** Pages Router support is on the roadmap, not in v0.1.
@@ -30,14 +30,20 @@ npm install -D click-to-edit
 pnpm add -D click-to-edit
 ```
 
-There are two pieces to wire up: the **provider** in your root layout, and a **route handler** that takes POSTed edits and writes them to disk.
+Then:
 
-> An `npx click-to-edit init` command is coming in v0.2. For now, copy-paste the two files below.
+```bash
+npx click-to-edit init
+```
+
+The init command wraps your root layout with `<ClickToEditProvider>` and creates the dev route handler at `app/api/click-to-edit/edit/route.ts`. It also prints a snippet to copy into your `next.config.js` (the one piece it doesn't auto-patch — see step 3 below). Idempotent: safe to re-run.
+
+If you'd rather do it by hand, the three pieces are:
 
 ### 1. Wrap your root layout
 
 ```tsx
-// app/layout.tsx
+// app/layout.tsx  (or src/app/layout.tsx)
 import { ClickToEditProvider } from "click-to-edit";
 
 export default function RootLayout({
@@ -58,14 +64,52 @@ export default function RootLayout({
 ### 2. Add the dev route handler
 
 ```ts
-// app/api/__cte/edit/route.ts
+// app/api/click-to-edit/edit/route.ts
 import { createEditHandler } from "click-to-edit/server";
 
 export const POST = createEditHandler();
 
-// Optional: block other verbs so the route's behavior is unambiguous.
+// Block other HTTP verbs so the route's behavior is unambiguous.
 export const GET = () => new Response("Method Not Allowed", { status: 405 });
 ```
+
+### 3. Register the build-time loader in `next.config.js`
+
+This is what stamps every JSX element with a `data-cte-loc` attribute so the overlay knows exactly which source line each DOM element came from. **The tool will not work without this step.**
+
+```js
+// next.config.js
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  // ...your existing config...
+
+  // For Next.js 16+ (Turbopack default):
+  turbopack: {
+    rules: {
+      "**/*.{tsx,jsx}": {
+        loaders: [{ loader: "click-to-edit/loader" }],
+      },
+    },
+  },
+
+  // For Next.js 14/15 with webpack (you can keep both — Next picks the
+  // matching one automatically):
+  webpack: (config, { dev }) => {
+    if (dev) {
+      config.module.rules.push({
+        test: /\.(tsx|jsx)$/,
+        exclude: /node_modules/,
+        use: [{ loader: "click-to-edit/loader" }],
+      });
+    }
+    return config;
+  },
+};
+
+module.exports = nextConfig;
+```
+
+The loader is a no-op outside `NODE_ENV=development` and on files inside `node_modules`. Zero production cost.
 
 That's it. Run your dev server, open your app, press `Cmd/Ctrl+E`, and click something.
 
@@ -80,28 +124,49 @@ That's it. Run your dev server, open your app, press `Cmd/Ctrl+E`, and click som
 
 ## What can and can't be edited
 
-`click-to-edit` only touches **literal text in JSX**. If a piece of text is computed at runtime — from a variable, a function call, a template literal, a translation key — it stays read-only. The overlay grays those nodes out so you can see what's editable at a glance.
+`click-to-edit` walks your source files looking for the literal string that produced the clicked text. It works on any text that lives as a string literal in the **same file** as the component that renders it — regardless of how the developer indexed into it.
 
 ```tsx
-// EDITABLE — JSXText literals
+// ✅ EDITABLE — plain JSX text
 <h1>Welcome to my app</h1>
-<p>Click the headline above with edit mode on.</p>
 
-// EDITABLE — StringLiteral inside a JSX expression container
-<button aria-label="Close">{"Close"}</button>
+// ✅ EDITABLE — text stored in a same-file const
+const headline = "Hello world";
+<h1>{headline}</h1>
 
-// NOT EDITABLE — identifier
-<h1>{title}</h1>
+// ✅ EDITABLE — marketing copy in an array (the .map case)
+const plans = [
+  { name: "Free", price: "$0" },
+  { name: "Pro",  price: "$29" },
+];
+plans.map((p) => <h3>{p.name}</h3>)
 
-// NOT EDITABLE — function call (this is what i18n looks like)
+// ✅ EDITABLE — via .find() / .filter() / .filter().map()
+const featured = items.find((i) => i.flag);
+<p>{featured.role}</p>
+
+// ✅ EDITABLE — ternary branches, ||/?? defaults
+<h1>{isPro ? "Pro Plan" : "Free Plan"}</h1>
+<h1>{label || "Default"}</h1>
+
+// ✅ EDITABLE — inline array literal (no const)
+{[{ title: "Card 1" }, { title: "Card 2" }].map((c) => <p>{c.title}</p>)}
+
+// ❌ NOT EDITABLE — from props (text isn't in source — caller passes it in)
+<h1>{user.name}</h1>
+
+// ❌ NOT EDITABLE — from a database / API fetch (text lives in the data source)
+<p>{post.title}</p>  // where post came from fetch() / useQuery / etc.
+
+// ❌ NOT EDITABLE — i18n call (displayed text is in your locales file)
 <h1>{t("home.headline")}</h1>
 
-// NOT EDITABLE — template literal
-<p>{`Hello ${name}`}</p>
-
-// NOT EDITABLE — conditional expression
-<p>{count > 0 ? "first branch" : "second branch"}</p>
+// ❌ NOT EDITABLE — imported from another file
+import { plans } from "./data";  // literal lives in ./data, not here
+plans.map((p) => <h3>{p.name}</h3>)
 ```
+
+The overlay shows a **yellow outline** on text that requires the source-walk fallback (slightly slower, may be ambiguous), **blue outline** for direct fiber-source hits, and **red outline** for genuinely non-editable content with a tooltip explaining why.
 
 If two identical literals are siblings inside the same JSX element, the server refuses to guess which one you meant and returns an `ambiguous` error. Reword one of them and try again.
 
