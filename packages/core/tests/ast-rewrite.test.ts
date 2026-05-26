@@ -21,6 +21,36 @@ describe("rewriteJsxText — JSXText", () => {
     }
   });
 
+  it("matches DOM-collapsed oldText against multi-line JSXText source", () => {
+    // Source: text broken across two lines with leading indentation.
+    // The DOM-rendered version collapses the newline+indent into a single
+    // space, so client sends a single-line oldText. Must still match.
+    const src = [
+      "export default function P() {",
+      "  return (",
+      "    <p>",
+      "      Stop scrolling through subreddits. RedditPulse surfaces the best conversations",
+      "      to join each day, with AI-suggested replies that actually fit in.",
+      "    </p>",
+      "  );",
+      "}",
+      "",
+    ].join("\n");
+
+    const col = src.split("\n")[2]!.indexOf("<p>");
+    const collapsedOld =
+      "Stop scrolling through subreddits. RedditPulse surfaces the best conversations to join each day, with AI-suggested replies that actually fit in.";
+    const newText =
+      "RedditPulse surfaces the best Reddit conversations for your product.";
+
+    const out = rewriteJsxText(src, 3, col, collapsedOld, newText);
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      expect(out.source).toContain(newText);
+      expect(out.source).not.toContain("Stop scrolling");
+    }
+  });
+
   it("preserves surrounding whitespace in multi-line JSXText", () => {
     const src = [
       "export default function P() {",
@@ -58,7 +88,7 @@ describe("rewriteJsxText — StringLiteral inside expression container", () => {
 });
 
 describe("rewriteJsxText — non-editable expressions", () => {
-  it("refuses {variable} with not_editable", () => {
+  it("refuses {variable} when the variable is a prop", () => {
     const src = [
       `export default function P({ name }: { name: string }) {`,
       `  return <h1>{name}</h1>;`,
@@ -68,11 +98,13 @@ describe("rewriteJsxText — non-editable expressions", () => {
     const out = rewriteJsxText(src, 2, col, "name", "World");
     expect(out.ok).toBe(false);
     if (!out.ok) {
-      expect(out.error).toBe("not_editable");
+      // Either "not_editable" (couldn't trace) or "mismatch" (traced but no
+      // literal in this file). Both are valid refusals.
+      expect(["not_editable", "mismatch"]).toContain(out.error);
     }
   });
 
-  it("refuses {t('key')} (call expression) with not_editable", () => {
+  it("refuses {t('key')} — the i18n key argument is NOT a marketing literal", () => {
     const src = [
       `export default function P() {`,
       `  return <h1>{t('key')}</h1>;`,
@@ -82,11 +114,14 @@ describe("rewriteJsxText — non-editable expressions", () => {
     const out = rewriteJsxText(src, 2, col, "key", "World");
     expect(out.ok).toBe(false);
     if (!out.ok) {
-      expect(out.error).toBe("not_editable");
+      // 'key' appears as a CallExpression argument (an i18n key) — the
+      // marketing-position filter rejects it. Refusal can manifest as
+      // either not_editable or mismatch.
+      expect(["not_editable", "mismatch"]).toContain(out.error);
     }
   });
 
-  it("refuses a template literal with not_editable", () => {
+  it("refuses a template literal interpolation", () => {
     const src = [
       "export default function P({ name }: { name: string }) {",
       "  return <h1>{`hi ${name}`}</h1>;",
@@ -96,7 +131,9 @@ describe("rewriteJsxText — non-editable expressions", () => {
     const out = rewriteJsxText(src, 2, col, "hi", "hello");
     expect(out.ok).toBe(false);
     if (!out.ok) {
-      expect(out.error).toBe("not_editable");
+      // Template literal parts are TemplateElements, not StringLiterals,
+      // so the file-scoped fallback can't find them. Refusal valid.
+      expect(["not_editable", "mismatch"]).toContain(out.error);
     }
   });
 });
@@ -144,6 +181,187 @@ describe("rewriteJsxText — error cases", () => {
     expect(out.ok).toBe(false);
     if (!out.ok) {
       expect(out.error).toBe("element_not_found");
+    }
+  });
+});
+
+describe("rewriteJsxText — follow-variable", () => {
+  it("Case 1: follows {identifier} to a `const X = 'literal'`", () => {
+    const src = [
+      `const title = "Hello";`,
+      `export default function P() {`,
+      `  return <h1>{title}</h1>;`,
+      `}`,
+    ].join("\n");
+    const col = src.split("\n")[2]!.indexOf("<h1>");
+    const out = rewriteJsxText(src, 3, col, "Hello", "Welcome");
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      expect(out.source).toContain('const title = "Welcome";');
+      expect(out.source).not.toContain('"Hello"');
+    }
+  });
+
+  it("Case 2: follows {obj.prop} to a `const obj = { prop: 'literal' }`", () => {
+    const src = [
+      `const config = { title: "Hello", subtitle: "world" };`,
+      `export default function P() {`,
+      `  return <h1>{config.title}</h1>;`,
+      `}`,
+    ].join("\n");
+    const col = src.split("\n")[2]!.indexOf("<h1>");
+    const out = rewriteJsxText(src, 3, col, "Hello", "Welcome");
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      expect(out.source).toContain('title: "Welcome"');
+      expect(out.source).toContain('subtitle: "world"');
+    }
+  });
+
+  it("Case 3: follows {p.prop} inside arr.map over const array of objects", () => {
+    const src = [
+      `const plans = [`,
+      `  { name: "Free",  description: "Get started." },`,
+      `  { name: "Pro",   description: "For serious founders." },`,
+      `];`,
+      `export default function P() {`,
+      `  return plans.map((plan) => <h3>{plan.name}</h3>);`,
+      `}`,
+    ].join("\n");
+    const col = src.split("\n")[5]!.indexOf("<h3>");
+    const out = rewriteJsxText(src, 6, col, "Pro", "Premium");
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      expect(out.source).toContain('{ name: "Premium",');
+      expect(out.source).toContain('{ name: "Free",'); // Free unchanged
+    }
+  });
+
+  it("Case 4: follows {item} inside arr.map over const string array", () => {
+    const src = [
+      `const features = ["Fast", "Reliable", "Cheap"];`,
+      `export default function P() {`,
+      `  return features.map((f) => <li>{f}</li>);`,
+      `}`,
+    ].join("\n");
+    const col = src.split("\n")[2]!.indexOf("<li>");
+    const out = rewriteJsxText(src, 3, col, "Reliable", "Trusted");
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      expect(out.source).toContain('"Trusted"');
+      expect(out.source).toContain('"Fast"'); // unchanged
+      expect(out.source).toContain('"Cheap"'); // unchanged
+    }
+  });
+
+  it("refuses with friendly error when variable can't be traced (e.g. function param from props)", () => {
+    const src = [
+      `export default function Greeting({ user }) {`,
+      `  return <h1>{user.name}</h1>;`,
+      `}`,
+    ].join("\n");
+    const col = src.split("\n")[1]!.indexOf("<h1>");
+    const out = rewriteJsxText(src, 2, col, "Alice", "Bob");
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      // Could be `not_editable` (couldn't trace) or `mismatch` (traced but
+      // not to a literal). Either way, NOT a successful edit.
+      expect(["not_editable", "mismatch"]).toContain(out.error);
+    }
+  });
+
+  it("file-scoped fallback: follows {x.field} through .find() (not just .map)", () => {
+    const src = [
+      `const testimonials = [`,
+      `  { role: "D2C Skincare Founder", author: "Sarah" },`,
+      `  { role: "B2B Marketer", author: "Marcus" },`,
+      `];`,
+      `export default function P() {`,
+      `  const featured = testimonials.find((t) => t.author === "Sarah");`,
+      `  return <p>{featured.role}</p>;`,
+      `}`,
+    ].join("\n");
+    const col = src.split("\n")[6]!.indexOf("<p>");
+    const out = rewriteJsxText(
+      src,
+      7,
+      col,
+      "D2C Skincare Founder",
+      "Founder",
+    );
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      expect(out.source).toContain('"Founder"');
+      expect(out.source).toContain('"B2B Marketer"'); // unchanged
+    }
+  });
+
+  it("inline-array-mapped: {opp.title} where the array is inline in JSX (not a const)", () => {
+    // This is the hero.tsx pattern that fails in real usage:
+    //   {[{ title: '...' }, ...].map(opp => <p>{opp.title}</p>)}
+    const src = [
+      `export default function P() {`,
+      `  return (`,
+      `    <div>`,
+      `      {[`,
+      `        { score: 92, title: 'Looking for a tool to find Reddit customers...' },`,
+      `        { score: 87, title: 'How do you guys market on Reddit without getting...' },`,
+      `      ].map((opp, i) => (`,
+      `        <p key={i}>{opp.title}</p>`,
+      `      ))}`,
+      `    </div>`,
+      `  );`,
+      `}`,
+    ].join("\n");
+    const col = src.split("\n")[7]!.indexOf("<p");
+    const out = rewriteJsxText(
+      src,
+      8,
+      col,
+      "Looking for a tool to find Reddit customers...",
+      "PROBE",
+    );
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      expect(out.source).toContain("'PROBE'");
+      expect(out.source).toContain("'How do you guys market on Reddit without getting...'"); // unchanged
+    }
+  });
+
+  it("file-scoped fallback: follows {x.field} through .filter().map() chain", () => {
+    const src = [
+      `const items = [`,
+      `  { label: "Hidden", visible: false },`,
+      `  { label: "Show Me", visible: true },`,
+      `];`,
+      `export default function P() {`,
+      `  return items.filter(i => i.visible).map((it) => <span>{it.label}</span>);`,
+      `}`,
+    ].join("\n");
+    const col = src.split("\n")[5]!.indexOf("<span>");
+    const out = rewriteJsxText(src, 6, col, "Show Me", "Visible Item");
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      expect(out.source).toContain('"Visible Item"');
+      expect(out.source).toContain('"Hidden"'); // unchanged
+    }
+  });
+
+  it("refuses with friendly error for ambiguous matches in followed array", () => {
+    const src = [
+      `const items = [`,
+      `  { label: "Click me" },`,
+      `  { label: "Click me" },`,
+      `];`,
+      `export default function P() {`,
+      `  return items.map((it) => <button>{it.label}</button>);`,
+      `}`,
+    ].join("\n");
+    const col = src.split("\n")[5]!.indexOf("<button>");
+    const out = rewriteJsxText(src, 6, col, "Click me", "Press me");
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.error).toBe("ambiguous");
     }
   });
 });

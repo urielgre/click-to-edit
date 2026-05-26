@@ -38,6 +38,10 @@
       "types": "./dist/server.d.ts",
       "import": "./dist/server.js",
       "require": "./dist/server.cjs"
+    },
+    "./loader": {
+      "types": "./dist/loader.d.ts",
+      "require": "./dist/loader.cjs"
     }
   },
   "bin": {

@@ -33,6 +33,25 @@ const SKIP_DIRS = new Set([
   "coverage",
 ]);
 
+/**
+ * Next.js file-name conventions that produce IMAGES, ICONS, or XML rather
+ * than DOM content. A user can never click on text inside these in the
+ * browser, so they shouldn't appear as candidates during search. Without
+ * this filter they create phantom duplicates that block legitimate edits.
+ */
+const SKIP_FILE_PATTERNS: RegExp[] = [
+  /(^|[/\\])opengraph-image\.(tsx?|jsx?)$/,
+  /(^|[/\\])twitter-image\.(tsx?|jsx?)$/,
+  /(^|[/\\])icon(\d*)\.(tsx?|jsx?)$/,
+  /(^|[/\\])apple-icon\.(tsx?|jsx?)$/,
+  /(^|[/\\])sitemap\.(tsx?|ts|js)$/,
+  /(^|[/\\])robots\.(tsx?|ts|js)$/,
+];
+
+function isSkippedFile(filePath: string): boolean {
+  return SKIP_FILE_PATTERNS.some((re) => re.test(filePath));
+}
+
 export type SearchHit = {
   /** Absolute path to the source file. */
   file: string;
@@ -84,10 +103,16 @@ export async function searchForEditPoint(
       } else if (entry.isFile()) {
         const ext = path.extname(entry.name);
         if (!ALLOWED_EXT.has(ext)) continue;
-        await scanFile(path.join(dir, entry.name));
+        const filePath = path.join(dir, entry.name);
+        if (isSkippedFile(filePath)) continue;
+        await scanFile(filePath);
       }
     }
   }
+
+  // Pre-compute the whitespace-collapsed form of the needle once; we reuse
+  // it for the cheap-substring fast-reject below.
+  const collapsedNeedle = trimmedOld.replace(/\s+/g, " ");
 
   async function scanFile(filePath: string): Promise<void> {
     let source: string;
@@ -96,9 +121,13 @@ export async function searchForEditPoint(
     } catch {
       return;
     }
-    // Fast rejection: if the file's raw text doesn't even mention oldText,
-    // skip the parse.
-    if (!source.includes(trimmedOld)) return;
+    // Fast rejection: collapse all whitespace runs in the file's source
+    // before substring-checking for the needle. Without this, multi-line
+    // JSXText (e.g. text wrapped onto two source lines with indentation in
+    // between) gets falsely rejected even though the AST walker below
+    // would correctly match it after normalization.
+    const collapsedSource = source.replace(/\s+/g, " ");
+    if (!collapsedSource.includes(collapsedNeedle)) return;
 
     let ast: unknown;
     try {
@@ -114,22 +143,31 @@ export async function searchForEditPoint(
     walkAst(ast, filePath);
   }
 
+  // Ancestor stack of JSXElements as the walker recurses. We use this to
+  // find the grandparent JSXElement when a match is detected — that wider
+  // context is what disambiguates two textually-identical literals that
+  // live in different parts of the codebase.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const jsxAncestors: any[] = [];
+
   function walkAst(node: unknown, filePath: string): void {
     if (!node || typeof node !== "object") return;
     if (Array.isArray(node)) {
       for (const n of node) walkAst(n, filePath);
       return;
     }
-    // We use `any` for the AST traversal — @babel/types isn't installed
-    // and the node shapes we touch are stable across babel versions.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const n = node as any;
 
     if (n.type === "JSXElement" && Array.isArray(n.children)) {
+      // Normalize once per search — source JSXText values can be multi-line
+      // (e.g. text wrapped onto two lines with leading indentation), while
+      // `trimmedOld` arrives DOM-collapsed. Both sides get the same shape.
+      const normalizedOld = normalizeWs(trimmedOld);
       for (const child of n.children) {
         let matched = false;
         if (child?.type === "JSXText" && typeof child.value === "string") {
-          if (child.value.trim() === trimmedOld) matched = true;
+          if (normalizeWs(child.value) === normalizedOld) matched = true;
         } else if (
           child?.type === "JSXExpressionContainer" &&
           child.expression?.type === "StringLiteral" &&
@@ -138,23 +176,36 @@ export async function searchForEditPoint(
           matched = true;
         }
         if (matched) {
+          // For disambiguation, use the wider context of the GRANDPARENT
+          // JSXElement (the top of the ancestor stack is `n`'s ancestors).
+          // Falls back to direct children if no grandparent exists.
+          const grandparent =
+            jsxAncestors.length > 0
+              ? jsxAncestors[jsxAncestors.length - 1]
+              : null;
+          const contextText = grandparent
+            ? collectAllJsxTextRecursive(grandparent, 0)
+            : collectLiteralText(n.children);
           candidates.push({
             file: filePath,
             line: n.loc?.start?.line ?? 0,
             column: (n.loc?.start?.column ?? 0) + 1, // convert 0-idx -> 1-idx
-            parentTextLiterals: collectLiteralText(n.children),
+            parentTextLiterals: contextText,
           });
         }
       }
     }
 
-    // Recurse into all object/array children except metadata fields.
+    // Push this JSXElement onto the ancestor stack while we descend.
+    const isJsxElement = n.type === "JSXElement";
+    if (isJsxElement) jsxAncestors.push(n);
     for (const key of Object.keys(n)) {
       if (key === "loc" || key === "tokens" || key === "comments" || key === "extra") {
         continue;
       }
       walkAst(n[key], filePath);
     }
+    if (isJsxElement) jsxAncestors.pop();
   }
 
   await walk(rootDir);
@@ -172,23 +223,29 @@ export async function searchForEditPoint(
     return { ok: true, hit: { file: c.file, line: c.line, column: c.column } };
   }
 
-  // Multiple candidates — try parent-text disambiguation.
+  // Multiple candidates — disambiguate via word-overlap between each
+  // candidate's surrounding-AST text and the client's DOM parentText.
+  //
+  // Substring containment (the previous approach) inverted the desired
+  // signal: a candidate with TIGHT context becomes a substring of any
+  // candidate with WIDER context, so the wrong file scored higher. Counting
+  // shared distinctive words is robust to context-length differences.
   if (parentText) {
-    const target = normalize(parentText);
-    // Score each candidate by how much of its literal text overlaps with
-    // the DOM parent text. Best-by-substring wins; ties => ambiguous.
-    const scored = candidates.map((c) => {
-      const cand = normalize(c.parentTextLiterals);
-      let score = 0;
-      if (cand && target.includes(cand)) score = cand.length;
-      else if (cand && cand.includes(target)) score = target.length;
-      return { c, score };
-    });
-    const maxScore = Math.max(...scored.map((s) => s.score));
-    if (maxScore > 0) {
-      const winners = scored.filter((s) => s.score === maxScore);
-      if (winners.length === 1) {
-        const w = winners[0]!.c;
+    const targetWords = wordSet(parentText, trimmedOld);
+    const scored = candidates.map((c) => ({
+      c,
+      score: wordOverlapScore(c.parentTextLiterals, targetWords, trimmedOld),
+    }));
+    const maxScore = Math.max(0, ...scored.map((s) => s.score));
+    // Require a meaningful lead — the best candidate must outscore the
+    // next-best by at least 2 distinctive words. Otherwise we treat the
+    // signal as too weak and fall through to the ambiguous return.
+    if (maxScore >= 2) {
+      const sorted = [...scored].sort((a, b) => b.score - a.score);
+      const top = sorted[0]!;
+      const runnerUp = sorted[1];
+      if (!runnerUp || top.score - runnerUp.score >= 2) {
+        const w = top.c;
         return {
           ok: true,
           hit: { file: w.file, line: w.line, column: w.column },
@@ -221,6 +278,83 @@ function collectLiteralText(children: unknown[]): string {
   return parts.join(" ");
 }
 
+/**
+ * Recursively gather all JSXText/StringLiteral values inside a JSXElement,
+ * descending through nested elements. Capped at depth=5 so a malicious or
+ * pathological tree can't run away. Used for disambiguation context: when
+ * two files have the same target text, the surrounding text usually
+ * differs and we lean on that.
+ */
+function collectAllJsxTextRecursive(node: unknown, depth: number): string {
+  if (depth > 5 || !node || typeof node !== "object") return "";
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const n = node as any;
+  const parts: string[] = [];
+  if (n.type === "JSXText" && typeof n.value === "string") {
+    parts.push(n.value);
+  } else if (
+    n.type === "JSXExpressionContainer" &&
+    n.expression?.type === "StringLiteral"
+  ) {
+    parts.push(n.expression.value);
+  } else if (Array.isArray(n.children)) {
+    for (const child of n.children) {
+      const t = collectAllJsxTextRecursive(child, depth + 1);
+      if (t) parts.push(t);
+    }
+  }
+  return parts.join(" ");
+}
+
 function normalize(s: string): string {
   return s.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+/**
+ * Case-preserving whitespace normalization. Used for matching `oldText`
+ * against JSXText `value`, which preserves source-side newlines and
+ * indentation that the browser collapses in the DOM. Case-sensitive — we
+ * still want "RedditPulse" to differ from "redditpulse".
+ */
+function normalizeWs(s: string): string {
+  return s.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Build a set of distinctive words from `text`, excluding (a) words shorter
+ * than 3 chars (high noise), (b) any word that appears in `excludeText` —
+ * which is the matching `oldText`. We exclude the match's own words because
+ * by definition every candidate contains them, so they contribute zero
+ * disambiguation signal.
+ */
+function wordSet(text: string, excludeText: string): Set<string> {
+  const exclude = new Set(
+    excludeText
+      .toLowerCase()
+      .split(/\W+/)
+      .filter((w) => w.length >= 3),
+  );
+  const out = new Set<string>();
+  for (const w of text.toLowerCase().split(/\W+/)) {
+    if (w.length >= 3 && !exclude.has(w)) out.add(w);
+  }
+  return out;
+}
+
+/**
+ * Number of distinctive words from `candidateText` that also appear in
+ * `targetWords`. Excludes any words shared with `excludeText` (the match
+ * itself), since those carry no disambiguation information.
+ */
+function wordOverlapScore(
+  candidateText: string,
+  targetWords: Set<string>,
+  excludeText: string,
+): number {
+  const candWords = wordSet(candidateText, excludeText);
+  let hits = 0;
+  for (const w of candWords) {
+    if (targetWords.has(w)) hits++;
+  }
+  return hits;
 }

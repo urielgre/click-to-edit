@@ -77,9 +77,10 @@ async function main(): Promise<void> {
     layoutStep = "ok";
   }
 
-  // Step 3: create route file
+  // Step 3: create route file. Anchor under whichever app base we found
+  // the layout in (either `app/` or `src/app/`).
   const routeRelative = path.posix.join(
-    "app",
+    layout.appBase,
     "api",
     "click-to-edit",
     "edit",
@@ -111,17 +112,60 @@ async function main(): Promise<void> {
         "  https://github.com/urielgre/click-to-edit#install",
     );
   } else {
-    console.log("Done. Next steps:");
+    printTurbopackInstructions();
+    console.log();
+    console.log("After updating next.config:");
     console.log("  1. Run your dev server (e.g. npm run dev)");
     console.log("  2. Open your app in the browser");
     console.log("  3. Press Cmd/Ctrl+E to toggle edit mode");
     console.log("  4. Click any text to edit it");
     if (routeStep === "skipped" && layoutStep === "skipped") {
-      console.log("\n(Nothing changed — both pieces were already in place.)");
+      console.log("\n(Nothing changed in files — both pieces were already in place.)");
     }
   }
 
   process.exit(exitCode);
+}
+
+/**
+ * Print copy-paste instructions for adding the build-time loader to the
+ * user's `next.config.js` / `next.config.ts`. We intentionally do NOT
+ * auto-edit that file — its shape varies (CJS / ESM / wrapped in
+ * withSomething()) and a bad patch would break the entire build. Manual
+ * is safer for v0.1.
+ */
+function printTurbopackInstructions(): void {
+  console.log(
+    [
+      "ONE MORE STEP — add the build-time loader to your next.config.{js,ts}.",
+      "Pick the snippet that matches your Next.js setup:",
+      "",
+      "  // For Next.js 16+ (Turbopack default):",
+      "  turbopack: {",
+      "    rules: {",
+      "      '**/*.{tsx,jsx}': {",
+      "        loaders: [{ loader: 'click-to-edit/loader' }],",
+      "      },",
+      "    },",
+      "  },",
+      "",
+      "  // For Next.js 14/15 (webpack default — or include alongside the above to support both):",
+      "  webpack: (config, { dev }) => {",
+      "    if (dev) {",
+      "      config.module.rules.push({",
+      "        test: /\\.(tsx|jsx)$/,",
+      "        exclude: /node_modules/,",
+      "        use: [{ loader: 'click-to-edit/loader' }],",
+      "      });",
+      "    }",
+      "    return config;",
+      "  },",
+      "",
+      "This injects a data-cte-loc attribute on every JSX element so",
+      "click-to-edit knows exactly which source line each DOM element came",
+      "from. The loader is a no-op in production builds.",
+    ].join("\n"),
+  );
 }
 
 function printHelp(): void {

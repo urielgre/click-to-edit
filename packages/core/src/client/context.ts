@@ -22,6 +22,17 @@ export type EditModeContextValue = {
   setEnabled: (v: boolean) => void;
   options: Required<ClickToEditOptions>;
   undoStack: UndoStack;
+  /**
+   * Live count of items on the undo stack. Used by the overlay to show /
+   * hide the visible Undo button. Driven by UndoStack.subscribe() in the
+   * provider.
+   */
+  undoCount: number;
+  /**
+   * Trigger undo programmatically (same effect as Cmd/Ctrl+Z). Used by the
+   * visible Undo button.
+   */
+  performUndo: () => void;
   showToast: (kind: ToastKind, message: string) => void;
 };
 

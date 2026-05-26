@@ -1,7 +1,7 @@
 import { defineConfig } from "tsup";
 
 /**
- * Three-config build:
+ * Four-config build:
  *   1. Client entry ("index") — bundled with a "use client" banner so the
  *      whole module is treated as a Client Component by Next.js App Router.
  *
@@ -11,6 +11,11 @@ import { defineConfig } from "tsup";
  *   3. CLI entry — emits `dist/cli.js` with a "#!/usr/bin/env node" shebang
  *      so the OS knows to run it with Node. Referenced from package.json's
  *      `bin` field so `npx click-to-edit init` works end-to-end.
+ *
+ *   4. Webpack/Turbopack loader — emits `dist/loader.cjs`. Loaders must be
+ *      CommonJS (the standard Next.js webpack loader contract). It's a
+ *      build-time module that runs in the Node toolchain process and stamps
+ *      `data-cte-loc` attributes onto every JSXOpeningElement.
  */
 export default defineConfig([
   {
@@ -45,8 +50,6 @@ export default defineConfig([
   },
   {
     entry: { cli: "src/cli/init.ts" },
-    // CLI is ESM-only. Modern Node (>=18) executes ESM bin scripts natively;
-    // CJS would require an extra cjs entry we don't need.
     format: ["esm"],
     dts: false,
     clean: false,
@@ -61,5 +64,16 @@ export default defineConfig([
       "node:fs/promises",
     ],
     banner: { js: "#!/usr/bin/env node" },
+  },
+  {
+    entry: { loader: "src/webpack/loader.ts" },
+    // Webpack loaders are CJS by Next.js convention. ESM loaders work but
+    // require extra config on the user side; CJS is the universal default.
+    format: ["cjs"],
+    dts: true,
+    clean: false,
+    sourcemap: true,
+    splitting: false,
+    external: ["@babel/parser"],
   },
 ]);

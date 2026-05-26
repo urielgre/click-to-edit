@@ -42,6 +42,7 @@ function DevProvider(props: {
     [props.options],
   );
   const [enabled, setEnabled] = React.useState(false);
+  const [undoCount, setUndoCount] = React.useState(0);
 
   // Undo stack persists for the lifetime of the page. Recreated only if the
   // limit changes (rare).
@@ -54,7 +55,10 @@ function DevProvider(props: {
   // can grab it without a re-render dance.
   React.useEffect(() => {
     useEditModeUndoStackRef.current = undoStack;
+    setUndoCount(undoStack.size());
+    const unsub = undoStack.subscribe(() => setUndoCount(undoStack.size()));
     return () => {
+      unsub();
       useEditModeUndoStackRef.current = null;
     };
   }, [undoStack]);
@@ -65,17 +69,28 @@ function DevProvider(props: {
     overlayEnqueueToast?.(kind, message);
   }, []);
 
+  // Programmatic undo — called by both the Cmd/Ctrl+Z hotkey and the
+  // visible Undo button in the overlay.
+  const performUndo = React.useCallback(async (): Promise<void> => {
+    const inverse = undoStack.popInverse();
+    if (!inverse) {
+      showToast("info", "Nothing to undo");
+      return;
+    }
+    const res = await postEdit(options.editRoute, inverse);
+    if (res.ok) {
+      showToast("success", "Undone");
+    } else {
+      showToast("error", `Undo failed: ${res.message || res.error}`);
+    }
+  }, [undoStack, options.editRoute, showToast]);
+
   // Hotkey listener: Cmd/Ctrl+E toggles edit mode, Esc exits, Cmd/Ctrl+Z
-  // undoes the last edit. We deliberately don't depend on tinykeys — the
-  // matching rules here are simple enough.
+  // undoes the last edit. Simple matching (no tinykeys dep) is enough for v0.1.
   React.useEffect(() => {
     const isHotkey = (e: KeyboardEvent): boolean => {
       const mod = e.metaKey || e.ctrlKey;
-      // Default hotkey is "Mod+E"; if the user passes something else we still
-      // honor Cmd/Ctrl+E for v0.1 since the format string is informational.
-      // (Full tinykeys-style parsing can land later without breaking API.)
       if (mod && (e.key === "e" || e.key === "E")) return true;
-      // Allow user-supplied single-letter binding "Mod+X":
       const match = /^Mod\+([A-Za-z])$/.exec(options.hotkey);
       const letter = match?.[1];
       if (letter && mod && e.key.toLowerCase() === letter.toLowerCase()) {
@@ -109,29 +124,23 @@ function DevProvider(props: {
       }
     };
 
-    const performUndo = async (): Promise<void> => {
-      const inverse = undoStack.popInverse();
-      if (!inverse) {
-        showToast("info", "Nothing to undo");
-        return;
-      }
-      const res = await postEdit(options.editRoute, inverse);
-      if (res.ok) {
-        showToast("success", "Undone");
-      } else {
-        showToast("error", `Undo failed: ${res.message || res.error}`);
-      }
-    };
-
     window.addEventListener("keydown", onKeyDown);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [enabled, options.editRoute, options.hotkey, showToast, undoStack]);
+  }, [enabled, options.hotkey, performUndo]);
 
   const value = React.useMemo(
-    () => ({ enabled, setEnabled, options, undoStack, showToast }),
-    [enabled, options, undoStack, showToast],
+    () => ({
+      enabled,
+      setEnabled,
+      options,
+      undoStack,
+      undoCount,
+      performUndo,
+      showToast,
+    }),
+    [enabled, options, undoStack, undoCount, performUndo, showToast],
   );
 
   return (

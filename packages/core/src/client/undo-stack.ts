@@ -16,13 +16,15 @@ export type UndoEntry = {
 };
 
 /**
- * In-memory bounded stack. Cleared on full page reload — that's intentional
- * for v0.1, since persisting undo across reloads would require knowing which
- * tab/page the user was on.
+ * In-memory bounded stack with a tiny pub-sub so React UI can react to size
+ * changes. Cleared on full page reload — that's intentional for v0.1, since
+ * persisting undo across reloads would require knowing which tab/page the
+ * user was on.
  */
 export class UndoStack {
   private entries: UndoEntry[] = [];
   private readonly limit: number;
+  private listeners = new Set<() => void>();
 
   constructor(limit: number = DEFAULTS.undoLimit) {
     this.limit = Math.max(0, limit);
@@ -35,6 +37,7 @@ export class UndoStack {
       // Drop the oldest. Cheap because limit is small (50 by default).
       this.entries.splice(0, this.entries.length - this.limit);
     }
+    this.notify();
   }
 
   /**
@@ -48,14 +51,38 @@ export class UndoStack {
   popInverse(): EditRequest | null {
     const top = this.entries.pop();
     if (!top) return null;
-    return {
-      file: top.request.file,
-      line: top.request.line,
-      column: top.request.column,
-      // Swap: the file currently has request.newText, we want previousText.
+    this.notify();
+
+    const inverse: EditRequest = {
       oldText: top.request.newText,
       newText: top.previousText,
     };
+
+    // Carry exact-mode coordinates if the original request had them.
+    if (
+      typeof top.request.file === "string" &&
+      typeof top.request.line === "number" &&
+      typeof top.request.column === "number"
+    ) {
+      inverse.file = top.request.file;
+      inverse.line = top.request.line;
+      inverse.column = top.request.column;
+    }
+
+    // For search-mode entries: the file's parent text has changed since the
+    // original edit (oldText -> newText). Patch the cached parentText so the
+    // server's text search can still find the target.
+    if (typeof top.request.parentText === "string") {
+      inverse.parentText = top.request.parentText.replace(
+        top.request.oldText,
+        top.request.newText,
+      );
+    }
+    if (top.request.siblingTexts) {
+      inverse.siblingTexts = top.request.siblingTexts.slice();
+    }
+
+    return inverse;
   }
 
   size(): number {
@@ -63,6 +90,30 @@ export class UndoStack {
   }
 
   clear(): void {
+    if (this.entries.length === 0) return;
     this.entries = [];
+    this.notify();
+  }
+
+  /**
+   * Subscribe to size/contents changes. Returns an unsubscribe function.
+   * Used by the provider to keep an `undoCount` React state in sync so the
+   * overlay can show/hide the Undo button.
+   */
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private notify(): void {
+    for (const listener of this.listeners) {
+      try {
+        listener();
+      } catch {
+        // listener errors must not corrupt the stack
+      }
+    }
   }
 }
