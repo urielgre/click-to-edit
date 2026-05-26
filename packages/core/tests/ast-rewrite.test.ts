@@ -347,6 +347,192 @@ describe("rewriteJsxText — follow-variable", () => {
     }
   });
 
+  // ---- diverse patterns from real-world Next.js apps ----
+
+  it("default-exported function component is walked (not skipped by export)", () => {
+    const src = [
+      `export default function Page() {`,
+      `  return <h1>Marketing Headline</h1>;`,
+      `}`,
+    ].join("\n");
+    const col = src.split("\n")[1]!.indexOf("<h1>");
+    const out = rewriteJsxText(src, 2, col, "Marketing Headline", "New");
+    expect(out.ok).toBe(true);
+  });
+
+  it("named arrow component export with same-file const", () => {
+    const src = [
+      `const heading = "Hello world";`,
+      `export const Page = () => <h1>{heading}</h1>;`,
+    ].join("\n");
+    const col = src.split("\n")[1]!.indexOf("<h1>");
+    const out = rewriteJsxText(src, 2, col, "Hello world", "Hi friend");
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      expect(out.source).toContain('"Hi friend"');
+    }
+  });
+
+  it("const defined inside the component body (not module-scoped)", () => {
+    const src = [
+      `export default function Page() {`,
+      `  const headline = "Block-scoped";`,
+      `  return <h1>{headline}</h1>;`,
+      `}`,
+    ].join("\n");
+    const col = src.split("\n")[2]!.indexOf("<h1>");
+    const out = rewriteJsxText(src, 3, col, "Block-scoped", "Fixed");
+    // We currently only collect top-level consts. Block-scoped const may
+    // not be resolved structurally, but the file-scoped fallback should
+    // find it since the literal exists in source.
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      expect(out.source).toContain('"Fixed"');
+    }
+  });
+
+  it("conditional rendering: {condition && <div>Marketing</div>}", () => {
+    const src = [
+      `export default function P({ show }: { show: boolean }) {`,
+      `  return <div>{show && <h1>Marketing Text</h1>}</div>;`,
+      `}`,
+    ].join("\n");
+    const col = src.split("\n")[1]!.indexOf("<h1>");
+    const out = rewriteJsxText(src, 2, col, "Marketing Text", "Conditional");
+    expect(out.ok).toBe(true);
+  });
+
+  it("spread element in array literal still finds the matching string", () => {
+    const src = [
+      `const base = [{ label: "First" }];`,
+      `const all = [...base, { label: "Second" }];`,
+      `export default function P() {`,
+      `  return all.map((x) => <li>{x.label}</li>);`,
+      `}`,
+    ].join("\n");
+    const col = src.split("\n")[3]!.indexOf("<li>");
+    const out = rewriteJsxText(src, 4, col, "Second", "Updated");
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      expect(out.source).toContain('"Updated"');
+    }
+  });
+
+  it("arrow component with implicit return", () => {
+    const src = [
+      `const Title = () => <h1>Implicit Return</h1>;`,
+      `export default Title;`,
+    ].join("\n");
+    const col = src.split("\n")[0]!.indexOf("<h1>");
+    const out = rewriteJsxText(src, 1, col, "Implicit Return", "Updated");
+    expect(out.ok).toBe(true);
+  });
+
+  it("Fragment-wrapped content: <>{...}</>", () => {
+    const src = [
+      `export default function P() {`,
+      `  return <><h1>Inside Fragment</h1><p>Body</p></>;`,
+      `}`,
+    ].join("\n");
+    const col = src.split("\n")[1]!.indexOf("<h1>");
+    const out = rewriteJsxText(src, 2, col, "Inside Fragment", "Updated");
+    expect(out.ok).toBe(true);
+  });
+
+  it("imported data: correctly refuses (literal lives in another file)", () => {
+    // Mimic: `import { plans } from './data'; ...{plan.name}...`. Since `plans`
+    // is imported (no local const), our resolver shouldn't find it, and the
+    // file-scoped fallback won't find the literal in THIS file.
+    const src = [
+      `import { plans } from "./data";`,
+      `export default function P() {`,
+      `  return plans.map((plan) => <h3>{plan.name}</h3>);`,
+      `}`,
+    ].join("\n");
+    const col = src.split("\n")[2]!.indexOf("<h3>");
+    const out = rewriteJsxText(src, 3, col, "Pro", "Premium");
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(["mismatch", "not_editable"]).toContain(out.error);
+    }
+  });
+
+  it("children prop: <Button>Click me</Button> — child is JSXText, editable", () => {
+    const src = [
+      `function Button({ children }: { children: React.ReactNode }) {`,
+      `  return <button>{children}</button>;`,
+      `}`,
+      `export default function P() {`,
+      `  return <Button>Press here</Button>;`,
+      `}`,
+    ].join("\n");
+    const col = src.split("\n")[4]!.indexOf("<Button>");
+    const out = rewriteJsxText(src, 5, col, "Press here", "Click me");
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      expect(out.source).toContain("Click me");
+    }
+  });
+
+  it("optional chaining {user?.name}: correctly refuses (dynamic)", () => {
+    const src = [
+      `export default function P({ user }: { user?: { name: string } }) {`,
+      `  return <h1>{user?.name}</h1>;`,
+      `}`,
+    ].join("\n");
+    const col = src.split("\n")[1]!.indexOf("<h1>");
+    const out = rewriteJsxText(src, 2, col, "Alice", "Bob");
+    expect(out.ok).toBe(false);
+  });
+
+  it("multiple const references: const A='x'; const B=A; <h1>{B}</h1>", () => {
+    const src = [
+      `const A = "Indirect";`,
+      `const B = A;`,
+      `export default function P() {`,
+      `  return <h1>{B}</h1>;`,
+      `}`,
+    ].join("\n");
+    const col = src.split("\n")[3]!.indexOf("<h1>");
+    const out = rewriteJsxText(src, 4, col, "Indirect", "Direct");
+    // B isn't directly a string literal; our resolver may not chase const A
+    // -> B. But the file-scoped fallback should find the literal "Indirect"
+    // in the const A declaration.
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      expect(out.source).toContain('"Direct"');
+    }
+  });
+
+  it("JSX text inside conditional ? : ternary", () => {
+    const src = [
+      `export default function P({ isPro }: { isPro: boolean }) {`,
+      `  return <h1>{isPro ? "Pro Plan" : "Free Plan"}</h1>;`,
+      `}`,
+    ].join("\n");
+    const col = src.split("\n")[1]!.indexOf("<h1>");
+    const out = rewriteJsxText(src, 2, col, "Pro Plan", "Premium Plan");
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      expect(out.source).toContain('"Premium Plan"');
+    }
+  });
+
+  it("default value with ||: const x = props.label || \"Default\"", () => {
+    const src = [
+      `export default function P({ label }: { label?: string }) {`,
+      `  const text = label || "Default label";`,
+      `  return <h1>{text}</h1>;`,
+      `}`,
+    ].join("\n");
+    const col = src.split("\n")[2]!.indexOf("<h1>");
+    const out = rewriteJsxText(src, 3, col, "Default label", "Updated");
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      expect(out.source).toContain('"Updated"');
+    }
+  });
+
   it("refuses with friendly error for ambiguous matches in followed array", () => {
     const src = [
       `const items = [`,

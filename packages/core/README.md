@@ -166,23 +166,61 @@ Most visual editors are either (a) CMS-first — content lives in their database
 
 ## Limitations
 
-Be honest with yourself about what this is, in v0.1:
+`click-to-edit` is bounded on purpose. Here's what it does and doesn't handle, with examples — so you know what to expect before you install it.
 
-- Only `JSXText` and `StringLiteral` nodes are editable. No restructuring of JSX trees.
-- No style edits. You still go to code for `className`, `style`, etc.
-- No multi-element edits (e.g. selecting across two `<p>` tags).
-- Requires React's dev mode `_debugSource` fiber data. Production builds strip this — which is fine, because the overlay is a no-op there anyway.
-- Ambiguous sibling literals are refused, not guessed.
-- No collaborative editing. One user, one machine, one source tree.
+### What's reliably editable
+
+| Pattern | Example | Status |
+|---|---|---|
+| Plain JSX text | `<h1>Welcome</h1>` | ✅ Always |
+| Multi-line JSX text | text wrapped across two source lines with indentation | ✅ Whitespace-normalized |
+| Mixed-content text nodes | `<h1>foo <span>bar</span></h1>` — click "foo" to edit just that text node | ✅ Text-node mode |
+| Marketing data in arrays | `const plans = [{name: 'Free', desc: '...'}]; plans.map(p => <h3>{p.name}</h3>)` | ✅ Via follow-variable |
+| Inline array `.map()` | `{[{title: '...'}, ...].map(o => <p>{o.title}</p>)}` | ✅ Via file-scoped fallback |
+| `.find()` / `.filter()` / `.filter().map()` chains | `const featured = items.find(i => i.flag); <p>{featured.role}</p>` | ✅ Via file-scoped fallback |
+| Indirect const chains | `const A = 'x'; const B = A; <h1>{B}</h1>` | ✅ Via file-scoped fallback |
+| Ternary literal branches | `<h1>{isPro ? 'Pro' : 'Free'}</h1>` | ✅ Position whitelist |
+| `\|\|` / `??` defaults | `const x = props.label \|\| 'Default'` | ✅ Position whitelist |
+| Block-scoped consts inside components | `function Page() { const x = "..."; return <h1>{x}</h1> }` | ✅ Via fallback |
+
+### What correctly refuses (with friendly error)
+
+| Pattern | Why we refuse |
+|---|---|
+| `<h1>{user.name}</h1>` where `user` is a prop | Text isn't in source — it's whoever passed the prop in. |
+| `<p>{post.title}</p>` from a `fetch()` / database / API | Same — text lives in the data source. Edit it there. |
+| `<h1>{t('home.title')}</h1>` (i18n call) | Displayed text is the translation, which lives in your locales file. |
+| Cross-file imports: `import { plans } from './data'` | We only search the same file. Move the data into the file, or edit the imported file directly. |
+| Same exact text in 2+ places in the same file | We refuse with `ambiguous`. Edit a unique nearby string first, then come back. |
+| Template literal interpolations (`` `hi ${name}` ``) | Can't safely splice parts of a runtime-built string. |
+| Computed property access (`obj[key]`, `arr[0]`) | We don't statically evaluate. Use a stable const for now. |
+| Anything inside `className`, `href`, `key`, `style`, `aria-*` | Excluded — these aren't display content. |
+| Anything inside `t()`, `console.log()`, function call args | Excluded — likely an i18n key or debug string, not display content. |
+
+### Other boundaries
+
+- **App Router only.** Pages Router (`pages/`) support is on the roadmap.
+- **Dev-mode only.** The provider is a no-op in production builds; the route handler hard-refuses any non-`NODE_ENV=development` request. There is no production click-to-edit (yet).
+- **One file at a time.** Each edit modifies exactly one `.tsx`/`.jsx`/`.ts`/`.js` file. No multi-file refactors.
+- **No collaborative editing.** One user, one machine.
+- **No style edits in v0.1.** You still go to code for `className`, padding, color, font. (Phase 2.)
+- **No structural edits.** You can change text; you can't reorder elements, add new ones, or delete elements via the overlay. (Phase 2.)
+- **Empty text allowed but ambiguous.** Saving an empty edit leaves an empty JSXText in source; if you didn't mean to clear it, use Cmd/Ctrl+Z or `git checkout`.
+- **`fragment` roots not editable directly.** A component whose JSX root is `<>...</>` has no opening element to stamp with `data-cte-loc`. Wrap the root in a real element (`<div>...</div>`) if you need editability there.
+
+### When in doubt
+
+If a piece of text refuses with no clear reason and you believe it's marketing copy, paste the exact text + the file path into a GitHub issue. The architecture is bounded but uniform — anything broken in your app is likely broken in others, and the fix is general.
 
 ## Roadmap
 
 Rough order, no dates:
 
-- `v0.2` — `npx click-to-edit init` install command, Pages Router support, better overlay UX (selection rings, error toasts).
-- `v0.3` — style edits (Tailwind class toggles, inline style tweaks).
-- `v0.4` — Vite / Remix adapters.
-- `v0.5+` — production-mode persistence via a pluggable CMS layer (so the same overlay can edit prod content, written to a CMS instead of source files).
+- `v0.2` — Pages Router support, `next.config` auto-patching during `init`, selection-toolbar (highlight text → toolbar with options).
+- `v0.3` — Style edits via the selection toolbar (bold/italic/underline + color/font/size by Tailwind class swap).
+- `v0.4` — Structural edits (move/reorder elements).
+- `v0.5` — Vite / Remix adapters.
+- `v0.6+` — Production-mode persistence via a pluggable CMS layer.
 
 ## Contributing
 
