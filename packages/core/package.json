@@ -1,7 +1,7 @@
 {
   "name": "click-to-edit",
-  "version": "0.1.0",
-  "description": "Click any text in your Next.js app, edit it inline, save to source. Dev-mode click-to-edit overlay for Next.js (App Router).",
+  "version": "0.1.1",
+  "description": "Click any text in dev mode and edit it inline. Saves to source.",
   "keywords": [
     "nextjs",
     "react",
