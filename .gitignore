@@ -15,3 +15,4 @@ coverage/
 
 # Local npm pack output (built during dev iteration; not source)
 packages/*/click-to-edit-*.tgz
+.release-notes-*.md
